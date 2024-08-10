@@ -72,7 +72,7 @@ async def get_release(
 
     :raises TooManyRequests: if the rate limit is exceeded
     """
-    url = releases_url + "?per_page=1" if prerelease else "/latest"
+    url = releases_url + ("?per_page=1" if prerelease else "/latest")
     async with session_.get(url) as resp:
         data = await resp.json()
 
@@ -234,4 +234,4 @@ async def update(
             stderr=subprocess.STDOUT
         )
 
-    os.execv(sys.executable, sys.argv)  # restart application
+    os.execv(sys.argv[0], sys.argv)  # restart application
