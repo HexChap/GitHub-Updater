@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-import asyncio
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
 from dataclasses import dataclass, asdict
+from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
 from shutil import unpack_archive
@@ -14,9 +13,9 @@ from typing import Callable, Any, Mapping
 
 import aiofiles
 import aiohttp
+from dacite import from_dict as from_dict_og, Config
 from loguru import logger
 from packaging.version import Version
-from dacite import from_dict as from_dict_og, Config
 
 FROZEN = getattr(sys, 'frozen', False)
 WIN_ROBOCOPY_OVERWRITE = (
@@ -317,12 +316,19 @@ async def get_last_update_date(date_path: Path | str) -> datetime:
             logger.critical(data + " is not a correct timestamp")
 
 
-def close_session(_):
-    if session:
-        asyncio.create_task(session.close())
+def on_error_close_session(f):
+    async def wrap(*args, **kwargs):
+        try:
+            await f(*args, **kwargs)
+        except Exception as e:
+            if session:
+                await session.close()
+            logger.exception(e)
+            sys.exit(1)
+    return wrap
 
 
-@logger.catch(onerror=close_session)
+@on_error_close_session
 async def update(
         *,
         repository_name: str,
