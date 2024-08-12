@@ -6,16 +6,17 @@ import subprocess
 import sys
 import tempfile
 from datetime import datetime
+from dataclasses import dataclass, asdict
 from http.client import HTTPException
 from pathlib import Path
 from shutil import unpack_archive
-from typing import Callable, Any
+from typing import Callable, Any, Mapping
 
 import aiofiles
 import aiohttp
 from loguru import logger
 from packaging.version import Version
-from pydantic import BaseModel
+from dacite import from_dict as from_dict_og, Config
 
 FROZEN = getattr(sys, 'frozen', False)
 WIN_ROBOCOPY_OVERWRITE = (
@@ -35,10 +36,6 @@ echo Done.
 """
 WIN_BATCH_PREFIX = 'ghau'
 WIN_BATCH_SUFFIX = '.bat'
-LAST_UPDATE_FILENAME = ".ghlastupdate"
-LAST_UPDATE_PATH = Path.cwd() / LAST_UPDATE_FILENAME
-if FROZEN:
-    LAST_UPDATE_PATH = Path.cwd() / "_internal" / LAST_UPDATE_FILENAME
 
 ARCHIVE_CONTENT_TYPES = ["application/zip", "application/x-gtar", "application/x-gzip", "application/x-zip-compressed"]
 
@@ -49,29 +46,53 @@ BASE_REPO_URL = "https://api.github.com/repos"
 # logger.configure(handlers=[dict(sink=sys.stdout, level="WARNING")])
 
 
-class Item(BaseModel):
+@dataclass
+class BaseDataclass:
+    def __post_init__(self):
+        dt_fieldnames = [
+            name
+            for name, field in type(self).__dataclass_fields__.items()
+            if field.type is datetime
+        ]
+
+        for fname in dt_fieldnames:
+            setattr(
+                self,
+                fname,
+                datetime.fromisoformat(getattr(self, fname))
+            )
+
+
+def from_dict[T](dclass: type[T], data: Mapping[str, Any]) -> T:
+    return from_dict_og(dclass, data, config=Config(check_types=False))
+
+
+@dataclass
+class Item(BaseDataclass):
     id: int
     url: str
     created_at: datetime
 
 
+@dataclass
 class Asset(Item):
     name: str
-    label: str | None = None
     content_type: str
     browser_download_url: str
     content_type: str
     updated_at: datetime
+    label: str | None = None
 
 
+@dataclass
 class Release(Item):
     tag_name: str
     body: str
     prerelease: bool
-    tarball_url: str | None = None
-    zipball_url: str | None = None
     published_at: datetime
     assets: list[Asset]
+    tarball_url: str | None = None
+    zipball_url: str | None = None
 
 
 class TooManyRequests(HTTPException):
@@ -104,11 +125,11 @@ async def get_release(
     if prerelease:
         data = data[0]
 
-    return Release.model_validate(data)
+    return from_dict(Release, data)
 
 
 def _use_filters(asset: Asset, filters: dict[str, Callable[[Any], bool]]) -> bool:
-    dumped = asset.model_dump()
+    dumped = asdict(asset)
     for field_name, filter_ in filters.items():
         if field_name not in dumped.keys():
             logger.warning(f"Key {field_name} doesn't exist on the asset with id {asset.id}")
@@ -271,23 +292,6 @@ def apply_update_and_restart(archive_path: str | Path, extract_dir: str | Path, 
     install_update_and_restart(extract_dir, install_dir)
 
 
-async def write_last_update():
-    async with aiofiles.open(LAST_UPDATE_PATH, "w+") as f:
-        await f.write(str(datetime.now().timestamp()))
-
-
-async def get_last_update() -> datetime:
-    if not LAST_UPDATE_PATH.is_file():
-        return datetime.fromtimestamp(0)
-
-    async with aiofiles.open(LAST_UPDATE_PATH, "r") as f:
-        data = await f.read()
-        try:
-            return datetime.fromtimestamp(float(data))
-        except ValueError:
-            logger.critical(data + " is not a correct timestamp")
-
-
 def restart_app():
     if FROZEN:
         os.execv(sys.executable, sys.argv)
@@ -296,19 +300,39 @@ def restart_app():
     os.execv(py, [py] + sys.argv)
 
 
+async def write_last_update_date(date_path: Path | str):
+    async with aiofiles.open(date_path, "w+") as f:
+        await f.write(str(datetime.now().timestamp()))
+
+
+async def get_last_update_date(date_path: Path | str) -> datetime:
+    if not date_path.is_file():
+        return datetime.fromtimestamp(0)
+
+    async with aiofiles.open(date_path, "r") as f:
+        data = await f.read()
+        try:
+            return datetime.fromtimestamp(float(data))
+        except ValueError:
+            logger.critical(data + " is not a correct timestamp")
+
+
 def close_session(_):
-    asyncio.create_task(session.close())
+    if session:
+        asyncio.create_task(session.close())
 
 
 @logger.catch(onerror=close_session)
 async def update(
-    *,
-    repository_name: str,
-    current_version: str,
-    install_dir: Path,
-    prerelease: bool = False,
-    asset_name_pattern: re.Pattern | str = r".*",
-    **asset_field_name_to_filter: Callable[[Any], bool]
+        *,
+        repository_name: str,
+        current_version: str,
+        install_dir: Path,
+        prerelease: bool = False,
+        asset_name_pattern: re.Pattern | str = r".*",
+        updates_rate_limit_secs: int = None,
+        last_update_date_path: str | Path = None,
+        **asset_field_name_to_filter: Callable[[Any], bool]
 ) -> bool:
     """ Updates the application from the specified GitHub repository.
 
@@ -317,8 +341,11 @@ async def update(
     :param install_dir: a path to the installation dir
     :param prerelease: apply prerelease if available
     :param asset_name_pattern: regex pattern for the target asset's name
+    :param updates_rate_limit_secs: amount of seconds between updates,
+        if specified last_update_date_path is required
+    :param last_update_date_path: file in which last updates' date is stored
     # :param requirements: if specified will install the requirements from the file specified
-    :param asset_field_name_to_filter: Asset model field name to filter function for it
+    :param asset_field_name_to_filter: Asset dataclass field name to filter function for it
     :returns: False if already latest version
     :raises ValueError: if wrong repository name, if there are none, more than one asset
         and if the asset is not an archive
@@ -326,10 +353,23 @@ async def update(
     """
     global session  # make it possible to close the session in outer functions
 
-    since_last_update = datetime.now() - await get_last_update()
-    if since_last_update.total_seconds() < 60 * 60:
-        logger.info(f"Last update was {int(since_last_update.total_seconds()) // 60} minutes ago. Skipping")
+    if not FROZEN:
+        logger.warning("The app is not frozen. Abort update")
         return False
+
+    rate_limiting = False
+    if updates_rate_limit_secs:
+        last_upd_path = last_update_date_path
+        if last_upd_path and Path(last_upd_path).is_file():
+            rate_limiting = True
+            since_last_update = datetime.now() - await get_last_update_date(last_update_date_path)
+            if since_last_update.total_seconds() < updates_rate_limit_secs:
+                logger.info(f"Last update was {int(since_last_update.total_seconds()) // 60} minutes ago. Skipping")
+                return False
+        else:
+            logger.critical("Rate limit file was not found")
+            raise ValueError("last_update_date_path is not specified or found. "
+                             "When updates_rate_limit_secs is specified last_update_date_path is required.")
 
     if not re.match(r"^.+/.+$", repository_name):
         raise ValueError("Incorrect repository name. Make sure it is in format {username}/{repo_name}")
@@ -376,7 +416,8 @@ async def update(
     await download_asset(session, asset.browser_download_url, archive_path)
 
     await session.close()
-    await write_last_update()
+    if rate_limiting:
+        await write_last_update_date(last_update_date_path)
 
     apply_update_and_restart(archive_path, extract_dir, install_dir)
 

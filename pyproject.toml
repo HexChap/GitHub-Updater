@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gh_auto_updater"
-version = "0.0.3"
+version = "0.1.0rc1"
 authors = [
   { name="Kirill Ibragimov", email="hexchap@gmail.com" },
 ]
@@ -14,7 +14,7 @@ requires-python = ">=3.12"
 dependencies = [
     "aiohttp~=3.10.3",
     "loguru~=0.7.2",
-    "pydantic~=2.8.2",
+    "dacite~=1.8.1",
     "aiofiles~=24.1.0",
     "packaging~=24.1"
 ]
