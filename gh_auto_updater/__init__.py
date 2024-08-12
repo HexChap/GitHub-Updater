@@ -366,15 +366,18 @@ async def update(
     rate_limiting = False
     if updates_rate_limit_secs:
         last_upd_path = last_update_date_path
-        if last_upd_path and Path(last_upd_path).is_file():
+        if last_upd_path:
+            last_upd_path = Path(last_upd_path)
             rate_limiting = True
-            since_last_update = datetime.now() - await get_last_update_date(last_update_date_path)
+
+            last_upd_path.parent.mkdir(exist_ok=True, parents=True)
+            since_last_update = datetime.now() - await get_last_update_date(last_upd_path)
             if since_last_update.total_seconds() < updates_rate_limit_secs:
                 logger.info(f"Last update was {int(since_last_update.total_seconds()) // 60} minutes ago. Skipping")
                 return False
         else:
             logger.critical("Rate limit file was not found")
-            raise ValueError("last_update_date_path is not specified or found. "
+            raise ValueError("last_update_date_path is not specified. "
                              "When updates_rate_limit_secs is specified last_update_date_path is required.")
 
     if not re.match(r"^.+/.+$", repository_name):
@@ -386,7 +389,7 @@ async def update(
     extract_dir = Path(tempfile.gettempdir()) / "ghautoupdater"
 
     extract_dir.mkdir(exist_ok=True, parents=True)
-    install_dir.mkdir(parents=True, exist_ok=True)
+    install_dir.mkdir(exist_ok=True, parents=True)
 
     try:
         release = await get_release(session, releases_url, prerelease=prerelease)
