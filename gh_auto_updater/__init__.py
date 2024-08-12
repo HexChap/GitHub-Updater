@@ -8,26 +8,45 @@ import tempfile
 from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
+from shutil import unpack_archive
 from typing import Callable, Any
 
 import aiofiles
 import aiohttp
-from shutil import unpack_archive
-from packaging.version import Version
 from loguru import logger
+from packaging.version import Version
 from pydantic import BaseModel
+
+FROZEN = getattr(sys, 'frozen', False)
+WIN_ROBOCOPY_OVERWRITE = (
+    '/e',  # include subdirectories, even if empty
+    '/move',  # deletes files and dirs from source dir after they've been copied
+    '/v',  # verbose (show what is going on)
+    '/w:2',  # set retry-timeout (default is 30 seconds)
+    '/XD asset'
+)
+WIN_BATCH_DELETE_SELF = '(goto) 2>nul & del "%~f0"'
+WIN_BATCH_TEMPLATE = """@echo off
+echo Moving app files...
+robocopy "{src_dir}" "{dst_dir}" {robocopy_options}
+echo Done.
+{restart_app}
+{delete_self}
+"""
+WIN_BATCH_PREFIX = 'ghau'
+WIN_BATCH_SUFFIX = '.bat'
+LAST_UPDATE_FILENAME = ".ghlastupdate"
+LAST_UPDATE_PATH = Path.cwd() / LAST_UPDATE_FILENAME
+if FROZEN:
+    LAST_UPDATE_PATH = Path.cwd() / "_internal" / LAST_UPDATE_FILENAME
 
 ARCHIVE_CONTENT_TYPES = ["application/zip", "application/x-gtar", "application/x-gzip", "application/x-zip-compressed"]
 
-# noinspection PyTypeChecker
-session: aiohttp.ClientSession = None
+session: aiohttp.ClientSession | None = None
 
 BASE_REPO_URL = "https://api.github.com/repos"
 
-MODULE_DIR = Path(__file__).resolve().parent
-INSTALL_DIR = MODULE_DIR
-
-logger.configure(handlers=[dict(sink=sys.stdout, level="WARNING")])
+# logger.configure(handlers=[dict(sink=sys.stdout, level="WARNING")])
 
 
 class Item(BaseModel):
@@ -122,33 +141,159 @@ def filter_assets(
 async def download_asset(
     session_: aiohttp.ClientSession,
     download_url: str,
-    download_path: Path
+    local_asset_path: Path
 ):
+    local_asset_path.parent.mkdir(exist_ok=True)
+
     chunk_size = 4096
 
     async with session_.get(download_url) as resp:
-        async with aiofiles.open(download_path, "wb") as f:
+        async with aiofiles.open(local_asset_path, "wb") as f:
             async for data in resp.content.iter_chunked(chunk_size):
                 # noinspection PyTypeChecker
                 await f.write(data)
 
 
-async def download_and_apply_archive(
-    session_: aiohttp.ClientSession,
-    filename: str,
-    download_url: str
-):
-    tmpdir = tempfile.TemporaryDirectory(dir=INSTALL_DIR)
-    path = Path(tmpdir.name)
+def run_bat_as_admin(file_path: Path | str):
+    """ **Taken from dennisvang/tufup**
+    Request elevation for windows command interpreter (opens UAC prompt) and
+    then run the specified .bat file.
 
-    await download_asset(
-        session_,
-        download_url,
-        path / filename
+    Returns True if successfully started, does not block, can continue after
+    calling process exits.
+    """
+    from ctypes import windll
+
+    # https://docs.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew
+    result = windll.shell32.ShellExecuteW(
+        None,  # handle to parent window
+        'runas',  # verb
+        'cmd.exe',  # file on which verb acts
+        ' '.join(['/c', f'"{file_path}"']),  # parameters
+        None,  # working directory (default is cwd)
+        1,  # show window normally
     )
-    unpack_archive(path / filename, INSTALL_DIR)
+    success = result > 32
+    if not success:
+        logger.error(
+            f'failed to run batch script as admin (ShellExecuteW returned {result})'
+        )
+    return success
 
-    tmpdir.cleanup()
+
+def install_update_and_restart(
+        src_dir: Path | str,
+        dst_dir: Path | str,
+        batch_template: str = WIN_BATCH_TEMPLATE,
+        as_admin: bool = False,
+        process_creation_flags=None,
+        restart_cmd: str = None,
+        **kwargs,  # noqa
+):
+    """ **Taken from dennisvang/tufup**
+    Create a batch script that moves files from src to dst, then run the
+    script in a new console, and exit the current process.
+
+    The script is created in a default temporary directory, and deletes
+    itself when done.
+
+    The `as_admin` options allows installation as admin (opens UAC dialog).
+
+    The `batch_template` option allows specification of custom batch-file
+    content. This may be in the form of a template string, as in the default
+    `WIN_BATCH_TEMPLATE`, or it may be a ready-made string without any
+    template variables. The following default template variables are
+    available for use in the custom template, although their use is optional:
+    {log_lines}, {src_dir}, {dst_dir}, {robocopy_options}, {delete_self}.
+    Custom template variables can be used as well, in which case you'll need
+    to specify `batch_template_extra_kwargs`.
+
+    The `process_creation_flags` option allows users to override creation flags for
+    the subprocess call that runs the batch script. For example, one could specify
+    `subprocess.CREATE_NO_WINDOW` to prevent a window from opening. See [2] and [3]
+    for details.
+
+    [1]: https://docs.microsoft.com/en-us/windows-server/administration/windows-commands/robocopy
+    [2]: https://docs.python.org/3/library/subprocess.html#windows-constants
+    [3]: https://learn.microsoft.com/en-us/windows/win32/procthread/process-creation-flags
+    """
+    # write temporary batch file (NOTE: The file is placed in the system
+    # default temporary dir, but the file is not removed automatically. So,
+    # either the batch file should self-delete when done, or it should be
+    # deleted by some other means, because windows does not clean the temp
+    # dir automatically.)
+    if not restart_cmd:
+        if FROZEN:
+            restart_cmd = f"start /d {dst_dir} {sys.executable} {" ".join(sys.argv)}"
+        else:
+            py = sys.executable
+            restart_cmd = f"cd /d {dst_dir}\n{py} " + " ".join(sys.argv)
+
+    robocopy_options = ' '.join(WIN_ROBOCOPY_OVERWRITE)
+    script_content = batch_template.format(
+        src_dir=src_dir,
+        dst_dir=dst_dir,
+        delete_self=WIN_BATCH_DELETE_SELF,
+        robocopy_options=robocopy_options,
+        restart_app=restart_cmd
+    )
+    logger.debug(f'writing windows batch script:\n{script_content}')
+    with tempfile.NamedTemporaryFile(
+            mode='w', prefix=WIN_BATCH_PREFIX, suffix=WIN_BATCH_SUFFIX, delete=False
+    ) as temp_file:
+        temp_file.write(script_content)
+    logger.debug(f'temporary batch script created: {temp_file.name}')
+
+    script_path = Path(temp_file.name).resolve()
+    logger.debug(f'starting script in new console: {script_path}')
+    # start the script in a separate process, non-blocking
+    if as_admin:
+        logger.debug('as admin')
+        run_bat_as_admin(file_path=script_path)
+    else:
+        # by default, we create a new console with window, but user can override this
+        # using the process_creation_flags argument
+        if process_creation_flags is None:
+            process_creation_flags = subprocess.CREATE_NEW_CONSOLE
+        else:
+            logger.debug('using custom process creation flags')
+        # we use Popen() instead of run(), because the latter blocks execution
+        subprocess.Popen([script_path], creationflags=process_creation_flags)
+    logger.debug('exiting')
+    # exit current process
+    sys.exit(0)
+
+
+def apply_update_and_restart(archive_path: str | Path, extract_dir: str | Path, install_dir: str | Path):
+    unpack_archive(archive_path, extract_dir)
+    logger.debug(f'files extracted to {extract_dir}')
+
+    install_update_and_restart(extract_dir, install_dir)
+
+
+async def write_last_update():
+    async with aiofiles.open(LAST_UPDATE_PATH, "w+") as f:
+        await f.write(str(datetime.now().timestamp()))
+
+
+async def get_last_update() -> datetime:
+    if not LAST_UPDATE_PATH.is_file():
+        return datetime.fromtimestamp(0)
+
+    async with aiofiles.open(LAST_UPDATE_PATH, "r") as f:
+        data = await f.read()
+        try:
+            return datetime.fromtimestamp(float(data))
+        except ValueError:
+            logger.critical(data + " is not a correct timestamp")
+
+
+def restart_app():
+    if FROZEN:
+        os.execv(sys.executable, sys.argv)
+
+    py = sys.executable
+    os.execv(py, [py] + sys.argv)
 
 
 def close_session(_):
@@ -160,18 +305,19 @@ async def update(
     *,
     repository_name: str,
     current_version: str,
+    install_dir: Path,
     prerelease: bool = False,
     asset_name_pattern: re.Pattern | str = r".*",
-    requirements: str | Path = None,
     **asset_field_name_to_filter: Callable[[Any], bool]
 ) -> bool:
     """ Updates the application from the specified GitHub repository.
 
     :param repository_name: the name of repository in format {username}/{repo_name}
     :param current_version: the current version of the app
+    :param install_dir: a path to the installation dir
     :param prerelease: apply prerelease if available
     :param asset_name_pattern: regex pattern for the target asset's name
-    :param requirements: if specified will install the requirements from the file specified
+    # :param requirements: if specified will install the requirements from the file specified
     :param asset_field_name_to_filter: Asset model field name to filter function for it
     :returns: False if already latest version
     :raises ValueError: if wrong repository name, if there are none, more than one asset
@@ -180,14 +326,21 @@ async def update(
     """
     global session  # make it possible to close the session in outer functions
 
+    since_last_update = datetime.now() - await get_last_update()
+    if since_last_update.total_seconds() < 60 * 60:
+        logger.info(f"Last update was {int(since_last_update.total_seconds()) // 60} minutes ago. Skipping")
+        return False
+
     if not re.match(r"^.+/.+$", repository_name):
         raise ValueError("Incorrect repository name. Make sure it is in format {username}/{repo_name}")
 
     releases_url = BASE_REPO_URL + f"/{repository_name}" + "/releases"
     session = aiohttp.ClientSession()
     current_version = Version(current_version)
+    extract_dir = Path(tempfile.gettempdir()) / "ghautoupdater"
 
-    INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    extract_dir.mkdir(exist_ok=True, parents=True)
+    install_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         release = await get_release(session, releases_url, prerelease=prerelease)
@@ -219,19 +372,23 @@ async def update(
     if asset.content_type not in ARCHIVE_CONTENT_TYPES:
         raise ValueError(asset.content_type + " is not a known archive type.")
 
-    await download_and_apply_archive(
-        session,
-        asset.name,
-        asset.browser_download_url
-    )
+    archive_path = extract_dir / "asset" / asset.name
+    await download_asset(session, asset.browser_download_url, archive_path)
 
     await session.close()
+    await write_last_update()
 
-    if requirements:
-        subprocess.check_call(
-            ["pip", "install", "-r", requirements],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT
-        )
+    apply_update_and_restart(archive_path, extract_dir, install_dir)
 
-    os.execv(sys.argv[0], sys.argv)  # restart application
+    # if requirements:
+    #     subprocess.check_call(
+    #         ["pip", "install", "-r", requirements],
+    #         stdout=subprocess.DEVNULL,
+    #         stderr=subprocess.STDOUT
+    #     )
+
+    # try:
+    #     restart_app()  # restart application
+    # except OSError as e:
+    #     print(sys.argv[0], sys.argv)
+    #     print(e)
