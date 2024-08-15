@@ -13,6 +13,7 @@ from typing import Callable, Any, Mapping
 
 import aiofiles
 import aiohttp
+import tqdm
 from dacite import from_dict as from_dict_og, Config
 from loguru import logger
 from packaging.version import Version
@@ -42,7 +43,7 @@ session: aiohttp.ClientSession | None = None
 
 BASE_REPO_URL = "https://api.github.com/repos"
 
-# logger.configure(handlers=[dict(sink=sys.stdout, level="WARNING")])
+logger.configure(handlers=[dict(sink=sys.stdout, level="INFO")])
 
 
 @dataclass
@@ -165,13 +166,20 @@ async def download_asset(
 ):
     local_asset_path.parent.mkdir(exist_ok=True)
 
+    asset_name = download_url.rpartition('/')[-1]
     chunk_size = 4096
 
+    logger.info("Downloading update")
     async with session_.get(download_url) as resp:
+        size = int(resp.headers.get('content-length', 0)) or None
+        pbar = tqdm.tqdm(desc=asset_name, total=size, leave=False)
+
         async with aiofiles.open(local_asset_path, "wb") as f:
             async for data in resp.content.iter_chunked(chunk_size):
                 # noinspection PyTypeChecker
                 await f.write(data)
+                # noinspection PyTypeChecker
+                pbar.update(len(data))
 
 
 def run_bat_as_admin(file_path: Path | str):
@@ -279,7 +287,7 @@ def install_update_and_restart(
             logger.debug('using custom process creation flags')
         # we use Popen() instead of run(), because the latter blocks execution
         subprocess.Popen([script_path], creationflags=process_creation_flags)
-    logger.debug('exiting')
+    logger.info('Successfully updated. Exiting and restarting.')
     # exit current process
     sys.exit(0)
 
@@ -338,6 +346,7 @@ async def update(
         asset_name_pattern: re.Pattern | str = r".*",
         updates_rate_limit_secs: int = None,
         last_update_date_path: str | Path = None,
+        allow_plain: bool = False,
         **asset_field_name_to_filter: Callable[[Any], bool]
 ) -> bool:
     """ Updates the application from the specified GitHub repository.
@@ -352,6 +361,7 @@ async def update(
     :param last_update_date_path: file in which last updates' date is stored
     # :param requirements: if specified will install the requirements from the file specified
     :param asset_field_name_to_filter: Asset dataclass field name to filter function for it
+    :param allow_plain: whether to allow plain scripts
     :returns: False if already latest version
     :raises ValueError: if wrong repository name, if there are none, more than one asset
         and if the asset is not an archive
@@ -359,7 +369,7 @@ async def update(
     """
     global session  # make it possible to close the session in outer functions
 
-    if not FROZEN:
+    if not allow_plain and not FROZEN:
         logger.warning("The app is not frozen. Abort update")
         return False
 
