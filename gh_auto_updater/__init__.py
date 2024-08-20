@@ -333,8 +333,7 @@ def on_error_close_session(f):
         except Exception as e:
             if session:
                 await session.close()
-            logger.exception(e)
-            sys.exit(1)
+            raise e
 
     return wrap
 
