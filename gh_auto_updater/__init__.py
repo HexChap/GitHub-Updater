@@ -142,9 +142,9 @@ def _use_filters(asset: Asset, filters: dict[str, Callable[[Any], bool]]) -> boo
 
 
 def filter_assets(
-    assets: list[Asset], *,
-    pattern: re.Pattern | str,
-    **filters
+        assets: list[Asset], *,
+        pattern: re.Pattern | str,
+        **filters
 ) -> list[Asset]:
     result = []
     for asset in assets:
@@ -160,9 +160,9 @@ def filter_assets(
 
 
 async def download_asset(
-    session_: aiohttp.ClientSession,
-    download_url: str,
-    local_asset_path: Path
+        session_: aiohttp.ClientSession,
+        download_url: str,
+        local_asset_path: Path
 ):
     local_asset_path.parent.mkdir(exist_ok=True)
 
@@ -307,21 +307,23 @@ def restart_app():
     os.execv(py, [py] + sys.argv)
 
 
-async def write_last_update_date(date_path: Path | str):
+async def write_last_check_date(date_path: Path | str):
     async with aiofiles.open(date_path, "w+") as f:
         await f.write(str(datetime.now().timestamp()))
 
 
-async def get_last_update_date(date_path: Path | str) -> datetime:
+async def get_last_check_date(date_path: Path | str) -> datetime:
     if not date_path.is_file():
         return datetime.fromtimestamp(0)
 
     async with aiofiles.open(date_path, "r") as f:
         data = await f.read()
+
         try:
             return datetime.fromtimestamp(float(data))
         except ValueError:
-            logger.critical(data + " is not a correct timestamp")
+            logger.critical(data + r" is not a correct timestamp")
+            raise
 
 
 def on_error_close_session(f):
@@ -333,6 +335,7 @@ def on_error_close_session(f):
                 await session.close()
             logger.exception(e)
             sys.exit(1)
+
     return wrap
 
 
@@ -344,8 +347,8 @@ async def update(
         install_dir: Path,
         prerelease: bool = False,
         asset_name_pattern: re.Pattern | str = r".*",
-        updates_rate_limit_secs: int = None,
-        last_update_date_path: str | Path = None,
+        checks_rate_limit_secs: int = None,
+        last_check_date_path: str | Path = None,
         allow_plain: bool = False,
         **asset_field_name_to_filter: Callable[[Any], bool]
 ) -> bool:
@@ -356,9 +359,9 @@ async def update(
     :param install_dir: a path to the installation dir
     :param prerelease: apply prerelease if available
     :param asset_name_pattern: regex pattern for the target asset's name
-    :param updates_rate_limit_secs: amount of seconds between updates,
-        if specified last_update_date_path is required
-    :param last_update_date_path: file in which last updates' date is stored
+    :param checks_rate_limit_secs: amount of seconds between update checks,
+        if specified, last_check_date_path is required
+    :param last_check_date_path: file in which last check's date is stored
     # :param requirements: if specified will install the requirements from the file specified
     :param asset_field_name_to_filter: Asset dataclass field name to filter function for it
     :param allow_plain: whether to allow plain scripts
@@ -374,21 +377,21 @@ async def update(
         return False
 
     rate_limiting = False
-    if updates_rate_limit_secs:
-        last_upd_path = last_update_date_path
-        if last_upd_path:
-            last_upd_path = Path(last_upd_path)
+    if checks_rate_limit_secs:
+        if last_check_date_path:
+            last_check_date_path = Path(last_check_date_path)
             rate_limiting = True
 
-            last_upd_path.parent.mkdir(exist_ok=True, parents=True)
-            since_last_update = datetime.now() - await get_last_update_date(last_upd_path)
-            if since_last_update.total_seconds() < updates_rate_limit_secs:
-                logger.info(f"Last update was {int(since_last_update.total_seconds()) // 60} minutes ago. Skipping")
+            last_check_date_path.parent.mkdir(exist_ok=True, parents=True)
+            since_last_check = datetime.now() - await get_last_check_date(last_check_date_path)
+            if since_last_check.total_seconds() < checks_rate_limit_secs:
+                logger.info(f"Last update check was {int(since_last_check.total_seconds()) // 60} minutes ago. "
+                            f"Skipping")
                 return False
         else:
             logger.critical("Rate limit file was not found")
-            raise ValueError("last_update_date_path is not specified. "
-                             "When updates_rate_limit_secs is specified last_update_date_path is required.")
+            raise ValueError("last_check_date_path is not specified. "
+                             "When updates_rate_limit_secs is specified last_check_date_path is required.")
 
     if not re.match(r"^.+/.+$", repository_name):
         raise ValueError("Incorrect repository name. Make sure it is in format {username}/{repo_name}")
@@ -409,6 +412,9 @@ async def update(
     except NotFound as e:
         logger.critical("Repository with name " + repository_name + " was not found")
         raise e
+
+    if rate_limiting:
+        await write_last_check_date(last_check_date_path)
 
     if current_version == Version(release.tag_name):
         logger.info("Latest version is already installed.")
@@ -435,8 +441,6 @@ async def update(
     await download_asset(session, asset.browser_download_url, archive_path)
 
     await session.close()
-    if rate_limiting:
-        await write_last_update_date(last_update_date_path)
 
     apply_update_and_restart(archive_path, extract_dir, install_dir)
 
