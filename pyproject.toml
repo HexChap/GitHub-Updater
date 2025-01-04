@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gh_auto_updater"
-version = "0.1.3rc2"
+version = "0.1.3rc3"
 authors = [
   { name="Kirill Ibragimov", email="hexchap@gmail.com" },
 ]
@@ -25,5 +25,5 @@ classifiers = [
 ]
 
 [project.urls]
-GitHub = "https://github.com/HexChap/ImagesManip"
-Issues = "https://github.com/HexChap/ImagesManip/issues"
+GitHub = "https://github.com/HexChap/GitHub-Updater"
+Issues = "https://github.com/HexChap/GitHub-Updater/issues"

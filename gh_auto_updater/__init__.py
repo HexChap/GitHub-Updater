@@ -9,7 +9,7 @@ from datetime import datetime
 from http.client import HTTPException
 from pathlib import Path
 from shutil import unpack_archive
-from typing import Callable, Any, Mapping
+from typing import Callable, Any, Mapping, Unpack
 
 import aiofiles
 import aiohttp
@@ -41,7 +41,7 @@ ARCHIVE_CONTENT_TYPES = ["application/zip", "application/x-gtar", "application/x
 
 session: aiohttp.ClientSession | None = None
 
-BASE_REPO_URL = "https://api.github.com/repos"
+BASE_REPOS_URL = "https://api.github.com/repos"
 
 logger.configure(handlers=[dict(sink=sys.stdout, level="INFO")])
 
@@ -143,15 +143,15 @@ def _use_filters(asset: Asset, filters: dict[str, Callable[[Any], bool]]) -> boo
 
 def filter_assets(
         assets: list[Asset], *,
-        pattern: re.Pattern | str,
-        **filters
+        name_pattern: re.Pattern | str,
+        **extra_filters: Unpack[Callable[[Any], bool]]
 ) -> list[Asset]:
     result = []
     for asset in assets:
-        if not re.match(pattern, asset.name):
+        if not re.match(name_pattern, asset.name):
             continue
 
-        if not _use_filters(asset, filters):
+        if not _use_filters(asset, extra_filters):
             continue
 
         result.append(asset)
@@ -299,12 +299,12 @@ def apply_update_and_restart(archive_path: str | Path, extract_dir: str | Path, 
     install_update_and_restart(extract_dir, install_dir)
 
 
-def restart_app():
-    if FROZEN:
-        os.execv(sys.executable, sys.argv)
-
-    py = sys.executable
-    os.execv(py, [py] + sys.argv)
+# def restart_app():
+#     if FROZEN:
+#         os.execv(sys.executable, sys.argv)
+#
+#     py = sys.executable
+#     os.execv(py, [py] + sys.argv)
 
 
 async def write_last_check_date(date_path: Path | str):
@@ -357,7 +357,7 @@ async def update(
     :param current_version: the current version of the app
     :param install_dir: a path to the installation dir
     :param prerelease: apply prerelease if available
-    :param asset_name_pattern: regex pattern for the target asset's name
+    :param asset_name_pattern: regex name_pattern for the target asset's name
     :param checks_rate_limit_secs: amount of seconds between update checks,
         if specified, last_check_date_path is required
     :param last_check_date_path: file in which last check's date is stored
@@ -375,27 +375,27 @@ async def update(
         logger.warning("The app is not frozen. Abort update")
         return False
 
+    if not re.match(r"^.+/.+$", repository_name):
+        raise ValueError("Incorrect repository name. Make sure it is in format {username}/{repo_name}")
+
     rate_limiting = False
     if checks_rate_limit_secs:
-        if last_check_date_path:
-            last_check_date_path = Path(last_check_date_path)
-            rate_limiting = True
-
-            last_check_date_path.parent.mkdir(exist_ok=True, parents=True)
-            since_last_check = datetime.now() - await get_last_check_date(last_check_date_path)
-            if since_last_check.total_seconds() < checks_rate_limit_secs:
-                logger.info(f"Last update check was {int(since_last_check.total_seconds()) // 60} minutes ago. "
-                            f"Skipping")
-                return False
-        else:
+        if not last_check_date_path:
             logger.critical("Rate limit file was not found")
             raise ValueError("last_check_date_path is not specified. "
                              "When updates_rate_limit_secs is specified last_check_date_path is required.")
 
-    if not re.match(r"^.+/.+$", repository_name):
-        raise ValueError("Incorrect repository name. Make sure it is in format {username}/{repo_name}")
+        last_check_date_path = Path(last_check_date_path)
+        rate_limiting = True
 
-    releases_url = BASE_REPO_URL + f"/{repository_name}" + "/releases"
+        last_check_date_path.parent.mkdir(exist_ok=True, parents=True)
+        since_last_check = datetime.now() - await get_last_check_date(last_check_date_path)
+        if since_last_check.total_seconds() < checks_rate_limit_secs:
+            logger.info(f"Last update check was {int(since_last_check.total_seconds()) // 60} minutes ago. "
+                        f"Skipping")
+            return False
+
+    releases_url = BASE_REPOS_URL + f"/{repository_name}" + "/releases"
     session = aiohttp.ClientSession()
     current_version = Version(current_version)
     extract_dir = Path(tempfile.gettempdir()) / "ghautoupdater"
@@ -406,7 +406,7 @@ async def update(
     try:
         release = await get_release(session, releases_url, prerelease=prerelease)
     except TooManyRequests:
-        logger.info("Rate limit exceeded")
+        logger.warning("Rate limit exceeded")
         return False
     except NotFound as e:
         logger.critical("Repository with name " + repository_name + " was not found")
@@ -422,7 +422,7 @@ async def update(
 
     assets = filter_assets(
         release.assets,
-        pattern=asset_name_pattern,
+        name_pattern=asset_name_pattern,
         **asset_field_name_to_filter
     )
 
@@ -434,7 +434,11 @@ async def update(
         asset = assets[0]
 
     if asset.content_type not in ARCHIVE_CONTENT_TYPES:
-        raise ValueError(asset.content_type + " is not a known archive type.")
+        raise ValueError(
+            asset.content_type +
+            " is not a supported archive type. Available options are: " +
+            " ".join(ARCHIVE_CONTENT_TYPES)
+        )
 
     archive_path = extract_dir / "asset" / asset.name
     await download_asset(session, asset.browser_download_url, archive_path)
