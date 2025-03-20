@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os
+import asyncio
 import re
 import subprocess
 import sys
@@ -39,11 +39,9 @@ WIN_BATCH_SUFFIX = '.bat'
 
 ARCHIVE_CONTENT_TYPES = ["application/zip", "application/x-gtar", "application/x-gzip", "application/x-zip-compressed"]
 
-session: aiohttp.ClientSession | None = None
-
 BASE_REPOS_URL = "https://api.github.com/repos"
 
-logger.configure(handlers=[dict(sink=sys.stdout, level="INFO")])
+logger.configure(handlers=[dict(sink=sys.stdout, level="DEBUG")])
 
 
 @dataclass
@@ -79,7 +77,6 @@ class Asset(Item):
     name: str
     content_type: str
     browser_download_url: str
-    content_type: str
     updated_at: datetime
     label: str | None = None
 
@@ -299,14 +296,6 @@ def apply_update_and_restart(archive_path: str | Path, extract_dir: str | Path, 
     install_update_and_restart(extract_dir, install_dir)
 
 
-# def restart_app():
-#     if FROZEN:
-#         os.execv(sys.executable, sys.argv)
-#
-#     py = sys.executable
-#     os.execv(py, [py] + sys.argv)
-
-
 async def write_last_check_date(date_path: Path | str):
     async with aiofiles.open(date_path, "w+") as f:
         await f.write(str(datetime.now().timestamp()))
@@ -326,19 +315,28 @@ async def get_last_check_date(date_path: Path | str) -> datetime:
             raise
 
 
-def on_error_close_session(f):
-    async def wrap(*args, **kwargs):
-        try:
-            await f(*args, **kwargs)
-        except Exception as e:
-            if session:
-                await session.close()
-            raise e
+async def close_session_on_shutdown(cb):
+    stopping = False
+    loop = asyncio.get_running_loop()
 
-    return wrap
+    async def _stop():
+        logger.debug("Executing on shutdown task")
+        await cb()  # Await the callback to complete asynchronously
+
+    def new_stop():
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            logger.debug("Loop is about to stop, running shutdown task")
+            # Schedule the shutdown task and stop the loop once it's complete
+            loop.create_task(_stop()).add_done_callback(lambda _: original_stop())
+        else:
+            original_stop()
+
+    original_stop = loop.stop
+    loop.stop = new_stop  # Override the stop method with our custom logic
 
 
-@on_error_close_session
 async def update(
         *,
         repository_name: str,
@@ -369,8 +367,6 @@ async def update(
         and if the asset is not an archive
     :raises NotFound: if repo with repository_name was not found
     """
-    global session  # make it possible to close the session in outer functions
-
     if not allow_plain and not FROZEN:
         logger.warning("The app is not frozen. Abort update")
         return False
@@ -395,8 +391,10 @@ async def update(
                         f"Skipping")
             return False
 
-    releases_url = BASE_REPOS_URL + f"/{repository_name}" + "/releases"
     session = aiohttp.ClientSession()
+    await close_session_on_shutdown(session.close)
+
+    releases_url = BASE_REPOS_URL + f"/{repository_name}" + "/releases"
     current_version = Version(current_version)
     extract_dir = Path(tempfile.gettempdir()) / "ghautoupdater"
 
@@ -446,16 +444,3 @@ async def update(
     await session.close()
 
     apply_update_and_restart(archive_path, extract_dir, install_dir)
-
-    # if requirements:
-    #     subprocess.check_call(
-    #         ["pip", "install", "-r", requirements],
-    #         stdout=subprocess.DEVNULL,
-    #         stderr=subprocess.STDOUT
-    #     )
-
-    # try:
-    #     restart_app()  # restart application
-    # except OSError as e:
-    #     print(sys.argv[0], sys.argv)
-    #     print(e)
